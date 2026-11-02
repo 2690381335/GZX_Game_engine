@@ -1,0 +1,2 @@
+# GZX_Game_engine
+为nodejs、python所开发的高性能游戏引擎，补缺此类语言中缺少高性能引擎，涵盖wndows及linux平台
