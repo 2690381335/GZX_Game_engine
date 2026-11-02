@@ -1,0 +1,14 @@
+{
+  "name": "gzx-engine",
+  "version": "1.0.0",
+  "description": "GZX 2D 游戏引擎的 Node.js 绑定，基于 koffi 调用原生引擎动态库，无需编译",
+  "main": "gzx.js",
+  "scripts": {
+    "demo": "node demo.js"
+  },
+  "keywords": ["game", "engine", "2d", "vulkan", "sdl3", "ffi", "koffi"],
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "dependencies": {
+    "koffi": "^2.11.0"
+  }
+}
