@@ -1,0 +1,718 @@
+"""GZX 2D 游戏引擎的 Python 接口，基于 ctypes 调用 libengine.so，无需编译。"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import struct
+from array import array
+from enum import IntEnum
+from pathlib import Path
+from typing import Iterator, NamedTuple, Optional, Sequence, Union
+
+__all__ = ["GzxError", "Key", "Mouse", "Space", "Sort", "BodyType", "Shape", "Color", "Uv", "Contact", "RayHit",
+           "SpriteBatch", "Engine", "Font", "World", "WHITE", "WHITE_TEXTURE"]
+
+
+def _load_library() -> ctypes.CDLL:
+    """按环境变量 GZX_LIBRARY、模块同目录、系统路径的顺序查找引擎库。"""
+    candidates = [os.environ.get("GZX_LIBRARY"), str(Path(__file__).with_name("libengine.so")), "libengine.so"]
+    errors = []
+    for candidate in filter(None, candidates):
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError as error:
+            errors.append(f"{candidate}: {error}")
+    raise OSError("无法加载 GZX 引擎库：\n" + "\n".join(errors))
+
+
+_lib = _load_library()
+
+_INVALID_ID = 0xFFFFFFFF
+_INVALID_HANDLE = 0xFFFFFFFFFFFFFFFF
+WHITE_TEXTURE = 0  # 内置 1x1 白色纹理
+
+
+class GzxError(RuntimeError):
+    """引擎调用失败时抛出，信息来自 gzx_last_error。"""
+
+
+def _error() -> GzxError:
+    return GzxError(_lib.gzx_last_error().decode("utf-8", "replace"))
+
+
+# ---------------------------------------------------------------------------
+# 枚举
+# ---------------------------------------------------------------------------
+
+class Key(IntEnum):
+    """键盘按键。"""
+    LEFT = 0; RIGHT = 1; UP = 2; DOWN = 3
+    SPACE = 4; ESCAPE = 5; ENTER = 6; TAB = 7; BACKSPACE = 8
+    LEFT_SHIFT = 9; RIGHT_SHIFT = 10; LEFT_CTRL = 11; RIGHT_CTRL = 12; LEFT_ALT = 13; RIGHT_ALT = 14
+    A = 15; B = 16; C = 17; D = 18; E = 19; F = 20; G = 21; H = 22; I = 23; J = 24; K = 25; L = 26; M = 27
+    N = 28; O = 29; P = 30; Q = 31; R = 32; S = 33; T = 34; U = 35; V = 36; W = 37; X = 38; Y = 39; Z = 40
+    NUM0 = 41; NUM1 = 42; NUM2 = 43; NUM3 = 44; NUM4 = 45; NUM5 = 46; NUM6 = 47; NUM7 = 48; NUM8 = 49; NUM9 = 50
+    F1 = 51; F2 = 52; F3 = 53; F4 = 54; F5 = 55; F6 = 56; F7 = 57; F8 = 58; F9 = 59; F10 = 60; F11 = 61; F12 = 62
+
+
+class Mouse(IntEnum):
+    """鼠标按键。"""
+    LEFT = 0; MIDDLE = 1; RIGHT = 2; X1 = 3; X2 = 4
+
+
+class Space(IntEnum):
+    """坐标空间。"""
+    WORLD = 0   # 世界坐标，受相机影响
+    SCREEN = 1  # 屏幕坐标，用于界面
+
+
+class Sort(IntEnum):
+    """精灵排序模式。"""
+    NONE = 0           # 按提交顺序
+    LAYER = 1          # 按层级稳定排序
+    LAYER_TEXTURE = 2  # 按层级再按纹理排序，合批效率最高
+
+
+class BodyType(IntEnum):
+    """刚体运动类型。"""
+    STATIC = 0; DYNAMIC = 1; KINEMATIC = 2
+
+
+class Shape(IntEnum):
+    """刚体碰撞形状。"""
+    BOX = 0; CIRCLE = 1
+
+
+# ---------------------------------------------------------------------------
+# C 结构体
+# ---------------------------------------------------------------------------
+
+class _Color(ctypes.Structure):
+    _fields_ = [("r", ctypes.c_float), ("g", ctypes.c_float), ("b", ctypes.c_float), ("a", ctypes.c_float)]
+
+
+class _Uv(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_float), ("top", ctypes.c_float), ("right", ctypes.c_float), ("bottom", ctypes.c_float)]
+
+
+class _Config(ctypes.Structure):
+    _fields_ = [("title", ctypes.c_char_p), ("width", ctypes.c_int32), ("height", ctypes.c_int32),
+                ("resizable", ctypes.c_int32), ("pause_when_minimized", ctypes.c_int32)]
+
+
+class _BodyDef(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int32), ("shape", ctypes.c_int32)] + \
+               [(name, ctypes.c_float) for name in ("x", "y", "half_width", "half_height", "radius", "velocity_x", "velocity_y",
+                                                    "mass", "restitution", "friction", "linear_damping", "gravity_scale")] + \
+               [("category", ctypes.c_uint32), ("mask", ctypes.c_uint32), ("sensor", ctypes.c_int32), ("user_data", ctypes.c_uint64)]
+
+
+class _Contact(ctypes.Structure):
+    _fields_ = [("a", ctypes.c_uint64), ("b", ctypes.c_uint64), ("normal_x", ctypes.c_float), ("normal_y", ctypes.c_float),
+                ("depth", ctypes.c_float), ("sensor", ctypes.c_int32)]
+
+
+class _RayHit(ctypes.Structure):
+    _fields_ = [("body", ctypes.c_uint64), ("x", ctypes.c_float), ("y", ctypes.c_float),
+                ("normal_x", ctypes.c_float), ("normal_y", ctypes.c_float), ("fraction", ctypes.c_float)]
+
+
+class Color(NamedTuple):
+    """RGBA 颜色，各分量 0 到 1。"""
+    r: float
+    g: float
+    b: float
+    a: float = 1.0
+
+
+class Uv(NamedTuple):
+    """纹理 UV 区域，左右交换即水平翻转。"""
+    left: float = 0.0
+    top: float = 0.0
+    right: float = 1.0
+    bottom: float = 1.0
+
+
+class Contact(NamedTuple):
+    """物理接触。"""
+    a: int
+    b: int
+    normal_x: float
+    normal_y: float
+    depth: float
+    sensor: bool
+
+
+class RayHit(NamedTuple):
+    """射线命中信息。"""
+    body: int
+    x: float
+    y: float
+    normal_x: float
+    normal_y: float
+    fraction: float
+
+
+WHITE = Color(1.0, 1.0, 1.0, 1.0)
+FULL_UV = Uv()
+
+# ---------------------------------------------------------------------------
+# 函数签名
+# ---------------------------------------------------------------------------
+
+_P = ctypes.c_void_p
+_F = ctypes.c_float
+_I32 = ctypes.c_int32
+_U32 = ctypes.c_uint32
+_U64 = ctypes.c_uint64
+_SZ = ctypes.c_size_t
+_PF = ctypes.POINTER(ctypes.c_float)
+_PI32 = ctypes.POINTER(ctypes.c_int32)
+_PU32 = ctypes.POINTER(ctypes.c_uint32)
+
+
+def _sig(name: str, restype, *argtypes) -> None:
+    function = getattr(_lib, name)
+    function.restype = restype
+    function.argtypes = list(argtypes)
+
+
+_sig("gzx_last_error", ctypes.c_char_p)
+_sig("gzx_config_init", None, ctypes.POINTER(_Config))
+_sig("gzx_create", _P, ctypes.POINTER(_Config))
+_sig("gzx_destroy", None, _P)
+_sig("gzx_begin_frame", ctypes.c_int, _P)
+_sig("gzx_end_frame", None, _P)
+_sig("gzx_delta_time", _F, _P)
+_sig("gzx_request_quit", None, _P)
+_sig("gzx_viewport", None, _P, _PI32, _PI32)
+for _name in ("gzx_key_down", "gzx_key_pressed", "gzx_key_released", "gzx_mouse_down", "gzx_mouse_pressed", "gzx_mouse_released"):
+    _sig(_name, ctypes.c_int, _P, _I32)
+_sig("gzx_mouse_position", None, _P, _PF, _PF)
+_sig("gzx_mouse_wheel", None, _P, _PF, _PF)
+_sig("gzx_load_texture", _U32, _P, ctypes.c_char_p)
+_sig("gzx_create_texture", _U32, _P, _U32, _U32, _P)
+_sig("gzx_texture_size", ctypes.c_int, _P, _U32, _PU32, _PU32)
+_sig("gzx_texture_region", _Uv, _P, _U32, _U32, _U32, _U32, _U32)
+_sig("gzx_sheet_uv", _Uv, _U32, _U32, _U32)
+_sig("gzx_set_background", None, _P, _Color)
+_sig("gzx_set_camera", None, _P, _F, _F, _F)
+_sig("gzx_set_sort", None, _P, _I32)
+_sig("gzx_draw_sprites", None, _P, _P, _SZ)
+_sig("gzx_draw_rect", None, _P, _F, _F, _F, _F, _Color, _I32, _I32)
+_sig("gzx_sprite_count", _SZ, _P)
+_sig("gzx_pick", ctypes.c_int64, _P, _F, _F)
+_sig("gzx_screen_to_world", None, _P, _F, _F, _PF, _PF)
+_sig("gzx_world_to_screen", None, _P, _F, _F, _PF, _PF)
+_sig("gzx_font_default", _P, _P)
+_sig("gzx_font_grid", _P, _P, _U32, _U32, _U32, _U32, _U32)
+_sig("gzx_font_ttf", _P, _P, ctypes.c_char_p, _F, ctypes.c_char_p)
+_sig("gzx_font_destroy", None, _P)
+_sig("gzx_draw_text", None, _P, _P, ctypes.c_char_p, _F, _F, _F, _Color, _I32, _I32)
+_sig("gzx_measure_text", None, _P, ctypes.c_char_p, _F, _PF, _PF)
+_sig("gzx_font_line_height", _F, _P)
+_sig("gzx_audio_available", ctypes.c_int, _P)
+_sig("gzx_load_sound", _U32, _P, ctypes.c_char_p)
+_sig("gzx_create_sound", _U32, _P, _P, _SZ, _U32, _U32)
+_sig("gzx_play", _U64, _P, _U32, _F, _F, ctypes.c_int)
+_sig("gzx_stop", None, _P, _U64)
+_sig("gzx_stop_all", None, _P)
+_sig("gzx_playing", ctypes.c_int, _P, _U64)
+_sig("gzx_set_voice_volume", None, _P, _U64, _F)
+_sig("gzx_set_voice_pan", None, _P, _U64, _F)
+_sig("gzx_set_master_volume", None, _P, _F)
+_sig("gzx_world_create", _P, _F, _F, _F)
+_sig("gzx_world_destroy", None, _P)
+_sig("gzx_body_def_init", None, ctypes.POINTER(_BodyDef))
+_sig("gzx_world_create_body", _U64, _P, ctypes.POINTER(_BodyDef))
+_sig("gzx_world_destroy_body", None, _P, _U64)
+_sig("gzx_world_valid", ctypes.c_int, _P, _U64)
+_sig("gzx_world_position", None, _P, _U64, _PF, _PF)
+_sig("gzx_world_set_position", None, _P, _U64, _F, _F)
+_sig("gzx_world_velocity", None, _P, _U64, _PF, _PF)
+_sig("gzx_world_set_velocity", None, _P, _U64, _F, _F)
+_sig("gzx_world_apply_impulse", None, _P, _U64, _F, _F)
+_sig("gzx_world_user_data", _U64, _P, _U64)
+_sig("gzx_world_set_gravity", None, _P, _F, _F)
+_sig("gzx_world_step", None, _P, _F, _I32, _I32)
+_sig("gzx_world_contacts", _SZ, _P, ctypes.POINTER(_Contact), _SZ)
+_sig("gzx_world_query_point", _SZ, _P, _F, _F, _U32, ctypes.POINTER(_U64), _SZ)
+_sig("gzx_world_query_rect", _SZ, _P, _F, _F, _F, _F, _U32, ctypes.POINTER(_U64), _SZ)
+_sig("gzx_world_raycast", ctypes.c_int, _P, _F, _F, _F, _F, _U32, ctypes.POINTER(_RayHit))
+_sig("gzx_world_positions", None, _P, _P, _SZ, _P)
+_sig("gzx_world_body_count", _SZ, _P)
+
+
+def _encode(text: Union[str, os.PathLike]) -> bytes:
+    return os.fsencode(text) if isinstance(text, os.PathLike) else str(text).encode("utf-8")
+
+
+def _color(color: Sequence[float]) -> _Color:
+    return _Color(color[0], color[1], color[2], color[3] if len(color) > 3 else 1.0)
+
+
+def _pair(function, *args) -> tuple[float, float]:
+    x, y = ctypes.c_float(), ctypes.c_float()
+    function(*args, ctypes.byref(x), ctypes.byref(y))
+    return x.value, y.value
+
+
+# ---------------------------------------------------------------------------
+# 批量精灵
+# ---------------------------------------------------------------------------
+
+_SPRITE = struct.Struct("<I4f4f4fif2fi")  # 与 C 端 GzxSprite 的 72 字节布局一致
+assert _SPRITE.size == 72
+
+
+class SpriteBatch:
+    """可复用的精灵缓冲区，大量精灵时比逐个 draw_sprite 快得多。"""
+
+    def __init__(self, capacity: int = 1024) -> None:
+        self._buffer = bytearray(_SPRITE.size * max(1, capacity))
+        self._view = (ctypes.c_char * len(self._buffer)).from_buffer(self._buffer)
+        self.count = 0
+
+    def clear(self) -> None:
+        """清空缓冲区，保留容量。"""
+        self.count = 0
+
+    def add(self, texture: int, x: float, y: float, width: float, height: float, uv: Sequence[float] = FULL_UV,
+            color: Sequence[float] = WHITE, rotation: float = 0.0, pivot_x: float = 0.5, pivot_y: float = 0.5,
+            layer: int = 0, space: int = Space.WORLD) -> None:
+        """追加一个精灵。"""
+        offset = self.count * _SPRITE.size
+        if offset + _SPRITE.size > len(self._buffer):
+            self._view = None  # 扩容前必须释放导出的缓冲区视图
+            self._buffer.extend(bytes(len(self._buffer)))
+            self._view = (ctypes.c_char * len(self._buffer)).from_buffer(self._buffer)
+        _SPRITE.pack_into(self._buffer, offset, texture, x, y, width, height,
+                          color[0], color[1], color[2], color[3] if len(color) > 3 else 1.0,
+                          uv[0], uv[1], uv[2], uv[3], int(space), rotation, pivot_x, pivot_y, layer)
+        self.count += 1
+
+
+# ---------------------------------------------------------------------------
+# 字体
+# ---------------------------------------------------------------------------
+
+class Font:
+    """位图字体，通过 Engine.default_font / grid_font / ttf_font 创建。"""
+
+    def __init__(self, handle: int) -> None:
+        self._handle = handle
+
+    def close(self) -> None:
+        """释放字体。"""
+        if self._handle:
+            _lib.gzx_font_destroy(self._handle)
+            self._handle = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def measure(self, text: str, scale: float = 1.0) -> tuple[float, float]:
+        """测量文本绘制后的 (宽, 高)。"""
+        return _pair(_lib.gzx_measure_text, self._handle, text.encode("utf-8"), scale)
+
+    @property
+    def line_height(self) -> float:
+        """行高（像素）。"""
+        return _lib.gzx_font_line_height(self._handle)
+
+
+# ---------------------------------------------------------------------------
+# 引擎
+# ---------------------------------------------------------------------------
+
+class Engine:
+    """引擎实例，一个实例对应一个窗口，必须在主线程使用。
+
+    用法::
+
+        with Engine("我的游戏") as engine:
+            for dt in engine.frames():
+                engine.draw_rect(100, 100, 50, 50, Color(1, 0, 0))
+    """
+
+    def __init__(self, title: str = "GZX Engine", width: int = 1280, height: int = 720,
+                 resizable: bool = True, pause_when_minimized: bool = True) -> None:
+        config = _Config()
+        _lib.gzx_config_init(ctypes.byref(config))
+        config.title = title.encode("utf-8")
+        config.width, config.height = width, height
+        config.resizable, config.pause_when_minimized = int(resizable), int(pause_when_minimized)
+        self._handle = _lib.gzx_create(ctypes.byref(config))
+        if not self._handle:
+            raise _error()
+        self._single = SpriteBatch(1)
+
+    # ---- 生命周期 ----
+
+    def close(self) -> None:
+        """销毁引擎和窗口。"""
+        if self._handle:
+            _lib.gzx_destroy(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> "Engine":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+    # ---- 主循环 ----
+
+    def begin_frame(self) -> bool:
+        """开始新的一帧，返回 False 表示应退出。"""
+        return bool(_lib.gzx_begin_frame(self._handle))
+
+    def end_frame(self) -> None:
+        """渲染本帧提交的内容。"""
+        _lib.gzx_end_frame(self._handle)
+
+    def frames(self) -> Iterator[float]:
+        """主循环迭代器，每次产出本帧的时间增量（秒），循环体结束后自动渲染。"""
+        while self.begin_frame():
+            yield self.delta_time
+            self.end_frame()
+
+    @property
+    def delta_time(self) -> float:
+        """本帧时间增量（秒），最大 0.25。"""
+        return _lib.gzx_delta_time(self._handle)
+
+    def request_quit(self) -> None:
+        """请求退出，下一次 begin_frame 返回 False。"""
+        _lib.gzx_request_quit(self._handle)
+
+    @property
+    def viewport(self) -> tuple[int, int]:
+        """视口尺寸 (宽, 高)，单位像素。"""
+        width, height = ctypes.c_int32(), ctypes.c_int32()
+        _lib.gzx_viewport(self._handle, ctypes.byref(width), ctypes.byref(height))
+        return width.value, height.value
+
+    # ---- 输入 ----
+
+    def key_down(self, key: Key) -> bool:
+        """按键当前是否按下。"""
+        return bool(_lib.gzx_key_down(self._handle, key))
+
+    def key_pressed(self, key: Key) -> bool:
+        """按键是否在本帧按下。"""
+        return bool(_lib.gzx_key_pressed(self._handle, key))
+
+    def key_released(self, key: Key) -> bool:
+        """按键是否在本帧释放。"""
+        return bool(_lib.gzx_key_released(self._handle, key))
+
+    def mouse_down(self, button: Mouse) -> bool:
+        """鼠标按键当前是否按下。"""
+        return bool(_lib.gzx_mouse_down(self._handle, button))
+
+    def mouse_pressed(self, button: Mouse) -> bool:
+        """鼠标按键是否在本帧按下。"""
+        return bool(_lib.gzx_mouse_pressed(self._handle, button))
+
+    def mouse_released(self, button: Mouse) -> bool:
+        """鼠标按键是否在本帧释放。"""
+        return bool(_lib.gzx_mouse_released(self._handle, button))
+
+    @property
+    def mouse_position(self) -> tuple[float, float]:
+        """鼠标在窗口中的位置（像素）。"""
+        return _pair(_lib.gzx_mouse_position, self._handle)
+
+    @property
+    def mouse_wheel(self) -> tuple[float, float]:
+        """本帧鼠标滚轮滚动量 (水平, 垂直)。"""
+        return _pair(_lib.gzx_mouse_wheel, self._handle)
+
+    # ---- 纹理 ----
+
+    def load_texture(self, path: Union[str, os.PathLike]) -> int:
+        """加载图片纹理，返回纹理 ID，重复加载同一路径返回同一 ID。"""
+        texture = _lib.gzx_load_texture(self._handle, _encode(path))
+        if texture == _INVALID_ID:
+            raise _error()
+        return texture
+
+    def create_texture(self, width: int, height: int, rgba: Union[bytes, bytearray, memoryview]) -> int:
+        """从 RGBA8 像素数据创建纹理，数据长度必须为 width * height * 4。"""
+        data = bytes(rgba)
+        if len(data) != width * height * 4:
+            raise ValueError("rgba 长度必须为 width * height * 4")
+        texture = _lib.gzx_create_texture(self._handle, width, height, data)
+        if texture == _INVALID_ID:
+            raise _error()
+        return texture
+
+    def texture_size(self, texture: int) -> tuple[int, int]:
+        """纹理尺寸 (宽, 高)。"""
+        width, height = ctypes.c_uint32(), ctypes.c_uint32()
+        if not _lib.gzx_texture_size(self._handle, texture, ctypes.byref(width), ctypes.byref(height)):
+            raise _error()
+        return width.value, height.value
+
+    def texture_region(self, texture: int, x: int, y: int, width: int, height: int) -> Uv:
+        """纹理中像素区域对应的 UV。"""
+        uv = _lib.gzx_texture_region(self._handle, texture, x, y, width, height)
+        return Uv(uv.left, uv.top, uv.right, uv.bottom)
+
+    @staticmethod
+    def sheet_uv(columns: int, rows: int, frame: int) -> Uv:
+        """网格精灵表第 frame 帧的 UV，帧按行优先编号。"""
+        uv = _lib.gzx_sheet_uv(columns, rows, frame)
+        return Uv(uv.left, uv.top, uv.right, uv.bottom)
+
+    # ---- 绘制 ----
+
+    def set_background(self, color: Sequence[float]) -> None:
+        """设置本帧背景颜色。"""
+        _lib.gzx_set_background(self._handle, _color(color))
+
+    def set_camera(self, x: float, y: float, zoom: float = 1.0) -> None:
+        """设置本帧相机，(x, y) 为视野左上角的世界坐标。"""
+        _lib.gzx_set_camera(self._handle, x, y, zoom)
+
+    def set_sort(self, mode: Sort) -> None:
+        """设置本帧精灵排序模式。"""
+        _lib.gzx_set_sort(self._handle, mode)
+
+    def draw_sprite(self, texture: int, x: float, y: float, width: float, height: float, uv: Sequence[float] = FULL_UV,
+                    color: Sequence[float] = WHITE, rotation: float = 0.0, pivot_x: float = 0.5, pivot_y: float = 0.5,
+                    layer: int = 0, space: int = Space.WORLD) -> None:
+        """绘制一个精灵，大量精灵请使用 SpriteBatch + draw_sprites。"""
+        self._single.clear()
+        self._single.add(texture, x, y, width, height, uv, color, rotation, pivot_x, pivot_y, layer, space)
+        _lib.gzx_draw_sprites(self._handle, ctypes.addressof(self._single._view), 1)
+
+    def draw_sprites(self, batch: SpriteBatch) -> None:
+        """一次提交整个精灵缓冲区。"""
+        if batch.count:
+            _lib.gzx_draw_sprites(self._handle, ctypes.addressof(batch._view), batch.count)
+
+    def draw_rect(self, x: float, y: float, width: float, height: float, color: Sequence[float] = WHITE,
+                  space: int = Space.WORLD, layer: int = 0) -> None:
+        """绘制纯色矩形。"""
+        _lib.gzx_draw_rect(self._handle, x, y, width, height, _color(color), space, layer)
+
+    @property
+    def sprite_count(self) -> int:
+        """本帧已提交的精灵数量。"""
+        return _lib.gzx_sprite_count(self._handle)
+
+    def pick(self, x: float, y: float) -> Optional[int]:
+        """屏幕坐标处最上层精灵的提交序号，未命中时为 None。"""
+        index = _lib.gzx_pick(self._handle, x, y)
+        return None if index < 0 else index
+
+    def screen_to_world(self, x: float, y: float) -> tuple[float, float]:
+        """屏幕坐标转世界坐标。"""
+        return _pair(_lib.gzx_screen_to_world, self._handle, x, y)
+
+    def world_to_screen(self, x: float, y: float) -> tuple[float, float]:
+        """世界坐标转屏幕坐标。"""
+        return _pair(_lib.gzx_world_to_screen, self._handle, x, y)
+
+    # ---- 字体与文本 ----
+
+    def default_font(self) -> Font:
+        """内置 8x8 ASCII 像素字体。"""
+        return self._font(_lib.gzx_font_default(self._handle))
+
+    def grid_font(self, texture: int, cell_width: int, cell_height: int, first: int = 32, count: int = 95) -> Font:
+        """从网格字体图集创建字体。"""
+        return self._font(_lib.gzx_font_grid(self._handle, texture, cell_width, cell_height, first, count))
+
+    def ttf_font(self, path: Union[str, os.PathLike], pixel_size: float, characters: str = "") -> Font:
+        """将 TTF/OTF 字体烘焙为图集，characters 为额外需要的字符（如中文）。"""
+        return self._font(_lib.gzx_font_ttf(self._handle, _encode(path), pixel_size, characters.encode("utf-8")))
+
+    @staticmethod
+    def _font(handle: Optional[int]) -> Font:
+        if not handle:
+            raise _error()
+        return Font(handle)
+
+    def draw_text(self, font: Font, text: str, x: float, y: float, scale: float = 1.0, color: Sequence[float] = WHITE,
+                  space: int = Space.SCREEN, layer: int = 0) -> None:
+        """绘制 UTF-8 文本，支持换行。"""
+        _lib.gzx_draw_text(self._handle, font._handle, text.encode("utf-8"), x, y, scale, _color(color), space, layer)
+
+    # ---- 音频 ----
+
+    @property
+    def audio_available(self) -> bool:
+        """音频设备是否可用。"""
+        return bool(_lib.gzx_audio_available(self._handle))
+
+    def load_sound(self, path: Union[str, os.PathLike]) -> int:
+        """加载声音文件（WAV/OGG/MP3/FLAC），返回声音 ID。"""
+        sound = _lib.gzx_load_sound(self._handle, _encode(path))
+        if sound == _INVALID_ID:
+            raise _error()
+        return sound
+
+    def create_sound(self, samples: Sequence[float], channels: int = 1, sample_rate: int = 48000) -> int:
+        """从浮点采样（-1 到 1，交错排列）创建声音。"""
+        data = samples if isinstance(samples, array) and samples.typecode == "f" else array("f", samples)
+        pointer = (ctypes.c_float * len(data)).from_buffer(data)
+        sound = _lib.gzx_create_sound(self._handle, ctypes.addressof(pointer), len(data), channels, sample_rate)
+        if sound == _INVALID_ID:
+            raise _error()
+        return sound
+
+    def play(self, sound: int, volume: float = 1.0, pan: float = 0.0, loop: bool = False) -> Optional[int]:
+        """播放声音，返回声部句柄，设备不可用或声部已满时为 None。"""
+        voice = _lib.gzx_play(self._handle, sound, volume, pan, int(loop))
+        return None if voice == _INVALID_HANDLE else voice
+
+    def stop(self, voice: int) -> None:
+        """停止声部。"""
+        _lib.gzx_stop(self._handle, voice)
+
+    def stop_all(self) -> None:
+        """停止所有声部。"""
+        _lib.gzx_stop_all(self._handle)
+
+    def playing(self, voice: int) -> bool:
+        """声部是否仍在播放。"""
+        return bool(_lib.gzx_playing(self._handle, voice))
+
+    def set_voice_volume(self, voice: int, volume: float) -> None:
+        """设置声部音量。"""
+        _lib.gzx_set_voice_volume(self._handle, voice, volume)
+
+    def set_voice_pan(self, voice: int, pan: float) -> None:
+        """设置声部声像，-1 最左，1 最右。"""
+        _lib.gzx_set_voice_pan(self._handle, voice, pan)
+
+    def set_master_volume(self, volume: float) -> None:
+        """设置主音量。"""
+        _lib.gzx_set_master_volume(self._handle, volume)
+
+
+# ---------------------------------------------------------------------------
+# 物理
+# ---------------------------------------------------------------------------
+
+class World:
+    """二维物理世界，y 轴向下，可独立于 Engine 使用。"""
+
+    def __init__(self, gravity_x: float = 0.0, gravity_y: float = 980.0, cell_size: float = 64.0) -> None:
+        self._handle = _lib.gzx_world_create(gravity_x, gravity_y, cell_size)
+        if not self._handle:
+            raise _error()
+        self._query = (ctypes.c_uint64 * 256)()
+
+    def close(self) -> None:
+        """销毁物理世界。"""
+        if self._handle:
+            _lib.gzx_world_destroy(self._handle)
+            self._handle = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def create_body(self, x: float, y: float, shape: Shape = Shape.BOX, type: BodyType = BodyType.DYNAMIC,
+                    half_width: float = 16.0, half_height: float = 16.0, radius: float = 16.0,
+                    velocity_x: float = 0.0, velocity_y: float = 0.0, mass: float = 1.0, restitution: float = 0.0,
+                    friction: float = 0.2, linear_damping: float = 0.0, gravity_scale: float = 1.0,
+                    category: int = 1, mask: int = 0xFFFFFFFF, sensor: bool = False, user_data: int = 0) -> int:
+        """创建刚体，返回刚体句柄。"""
+        definition = _BodyDef(int(type), int(shape), x, y, half_width, half_height, radius, velocity_x, velocity_y, mass,
+                              restitution, friction, linear_damping, gravity_scale, category, mask, int(sensor), user_data)
+        body = _lib.gzx_world_create_body(self._handle, ctypes.byref(definition))
+        if body == _INVALID_HANDLE:
+            raise _error()
+        return body
+
+    def destroy_body(self, body: int) -> None:
+        """销毁刚体。"""
+        _lib.gzx_world_destroy_body(self._handle, body)
+
+    def valid(self, body: int) -> bool:
+        """刚体句柄是否有效。"""
+        return bool(_lib.gzx_world_valid(self._handle, body))
+
+    def position(self, body: int) -> tuple[float, float]:
+        """刚体中心位置。"""
+        return _pair(_lib.gzx_world_position, self._handle, body)
+
+    def set_position(self, body: int, x: float, y: float) -> None:
+        """瞬移刚体。"""
+        _lib.gzx_world_set_position(self._handle, body, x, y)
+
+    def velocity(self, body: int) -> tuple[float, float]:
+        """刚体速度。"""
+        return _pair(_lib.gzx_world_velocity, self._handle, body)
+
+    def set_velocity(self, body: int, x: float, y: float) -> None:
+        """设置刚体速度。"""
+        _lib.gzx_world_set_velocity(self._handle, body, x, y)
+
+    def apply_impulse(self, body: int, x: float, y: float) -> None:
+        """施加冲量。"""
+        _lib.gzx_world_apply_impulse(self._handle, body, x, y)
+
+    def user_data(self, body: int) -> int:
+        """刚体的用户数据。"""
+        return _lib.gzx_world_user_data(self._handle, body)
+
+    def set_gravity(self, x: float, y: float) -> None:
+        """设置重力。"""
+        _lib.gzx_world_set_gravity(self._handle, x, y)
+
+    def step(self, delta_time: float, substeps: int = 1, iterations: int = 4) -> None:
+        """推进模拟。"""
+        _lib.gzx_world_step(self._handle, delta_time, substeps, iterations)
+
+    def contacts(self) -> list[Contact]:
+        """最近一次步进产生的接触。"""
+        total = _lib.gzx_world_contacts(self._handle, None, 0)
+        buffer = (_Contact * total)()
+        _lib.gzx_world_contacts(self._handle, buffer, total)
+        return [Contact(c.a, c.b, c.normal_x, c.normal_y, c.depth, bool(c.sensor)) for c in buffer]
+
+    def _collect(self, function, *args) -> list[int]:
+        total = function(self._handle, *args, self._query, len(self._query))
+        if total > len(self._query):
+            self._query = (ctypes.c_uint64 * total)()
+            function(self._handle, *args, self._query, total)
+        return list(self._query[:total])
+
+    def query_point(self, x: float, y: float, mask: int = 0xFFFFFFFF) -> list[int]:
+        """查询包含该点的刚体。"""
+        return self._collect(_lib.gzx_world_query_point, x, y, mask)
+
+    def query_rect(self, left: float, top: float, right: float, bottom: float, mask: int = 0xFFFFFFFF) -> list[int]:
+        """查询与矩形重叠的刚体。"""
+        return self._collect(_lib.gzx_world_query_rect, left, top, right, bottom, mask)
+
+    def raycast(self, x0: float, y0: float, x1: float, y1: float, mask: int = 0xFFFFFFFF) -> Optional[RayHit]:
+        """射线检测，返回最近的命中，未命中时为 None。"""
+        hit = _RayHit()
+        if not _lib.gzx_world_raycast(self._handle, x0, y0, x1, y1, mask, ctypes.byref(hit)):
+            return None
+        return RayHit(hit.body, hit.x, hit.y, hit.normal_x, hit.normal_y, hit.fraction)
+
+    def positions(self, bodies: Sequence[int]) -> array:
+        """批量读取刚体位置，返回 array('f')，按 x, y 交错排列。"""
+        handles = array("Q", bodies)
+        out = array("f", bytes(8 * len(handles)))
+        if handles:
+            source = (ctypes.c_uint64 * len(handles)).from_buffer(handles)
+            target = (ctypes.c_float * len(out)).from_buffer(out)
+            _lib.gzx_world_positions(self._handle, ctypes.addressof(source), len(handles), ctypes.addressof(target))
+        return out
+
+    @property
+    def body_count(self) -> int:
+        """存活的刚体数量。"""
+        return _lib.gzx_world_body_count(self._handle)
